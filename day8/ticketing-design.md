@@ -197,6 +197,146 @@ A unique constraint on seat_id ensures that a seat cannot be allocated to multip
 - Each order item references one seat. The unique seat constraint prevents a seat from appearing in multiple order items.
 - One order can have payment attempts recorded in Payments, with provider references used to identify individual transactions.
 
+### 4.8 Explicit SQL Schema and Constraints
+
+The following PostgreSQL-style schema makes the primary keys, foreign keys, data types and uniqueness constraints explicit.
+
+```sql
+CREATE TABLE users (
+    user_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE events (
+    event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    starts_at TIMESTAMPTZ NOT NULL,
+    sale_starts_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('draft', 'on_sale', 'sold_out', 'cancelled')
+    )
+);
+
+CREATE TABLE seats (
+    seat_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id BIGINT NOT NULL REFERENCES events(event_id),
+    seat_label TEXT NOT NULL,
+    price NUMERIC(10,2) NOT NULL CHECK (price >= 0),
+    status TEXT NOT NULL DEFAULT 'available'
+        CHECK (status IN ('available', 'held', 'sold')),
+    hold_id UUID,
+    hold_expires_at TIMESTAMPTZ,
+    held_by_user_id BIGINT REFERENCES users(user_id),
+
+    UNIQUE (event_id, seat_label),
+
+    CHECK (
+        (status = 'available'
+            AND hold_id IS NULL
+            AND hold_expires_at IS NULL
+            AND held_by_user_id IS NULL)
+        OR
+        (status = 'held'
+            AND hold_id IS NOT NULL
+            AND hold_expires_at IS NOT NULL
+            AND held_by_user_id IS NOT NULL)
+        OR
+        (status = 'sold'
+            AND hold_id IS NULL
+            AND hold_expires_at IS NULL
+            AND held_by_user_id IS NULL)
+    )
+);
+
+CREATE TABLE orders (
+    order_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(user_id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN (
+            'pending', 'confirmed', 'failed', 'cancelled'
+        )),
+    total_amount NUMERIC(10,2) NOT NULL CHECK (total_amount >= 0),
+    idempotency_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (user_id, idempotency_key)
+);
+
+CREATE TABLE order_items (
+    order_item_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES orders(order_id),
+    seat_id BIGINT NOT NULL REFERENCES seats(seat_id),
+    ticket_price NUMERIC(10,2) NOT NULL CHECK (ticket_price >= 0),
+    ticket_code UUID NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'confirmed', 'cancelled'))
+);
+
+CREATE UNIQUE INDEX one_active_order_item_per_seat
+    ON order_items(seat_id)
+    WHERE status IN ('pending', 'confirmed');
+
+CREATE TABLE payments (
+    payment_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES orders(order_id),
+    provider_reference TEXT UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    amount NUMERIC(10,2) NOT NULL CHECK (amount >= 0),
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'successful', 'failed', 'refunded')
+    ),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX seats_event_status_idx
+    ON seats(event_id, status);
+
+CREATE INDEX seats_hold_expiry_idx
+    ON seats(hold_expires_at)
+    WHERE status = 'held';
+
+CREATE INDEX orders_user_created_idx
+    ON orders(user_id, created_at DESC);
+
+CREATE INDEX order_items_order_idx
+    ON order_items(order_id);
+
+CREATE INDEX payments_order_idx
+    ON payments(order_id);
+```
+
+**Why these constraints matter:**
+
+- Primary keys uniquely identify records.
+- Foreign keys prevent orders, seats and payments from referencing nonexistent records.
+- `UNIQUE (event_id, seat_label)` prevents duplicate seat definitions within an event.
+- The partial unique index permits at most one active or confirmed order item per seat. Cancelled items do not permanently prevent the seat from being sold again.
+- Unique idempotency keys prevent duplicate orders and duplicate payment-operation records when clients retry requests.
+- Indexes speed up event-seat lookups, hold-expiry processing and order-history queries.
+
+These constraints complement application-level validation. The application must still perform valid state transitions inside transactions; a schema constraint alone cannot safely coordinate the complete payment workflow.
+
+### 4.9 Hold Expiration and Deadlock Prevention
+
+Every seat hold receives a unique `hold_id` and an expiry timestamp, such as five minutes after creation. The database clock, rather than the customer's browser clock, determines whether a hold has expired.
+
+A background worker periodically finds expired holds and releases them. Before releasing a seat, it must lock the row and verify that the current `hold_id` still matches the expired hold and that the expiry time has passed. This prevents an old cleanup job from releasing a seat that has since been held by another customer.
+
+New hold requests must also check for expired holds while locking the relevant seat rows. This ensures that an expired seat can be reclaimed even if the cleanup worker is delayed.
+
+To reduce deadlocks:
+
+1. Lock multiple seat rows in ascending `seat_id` order in every transaction.
+2. Keep database transactions short and avoid network calls while holding seat locks.
+3. Set sensible transaction and lock timeouts.
+4. If a deadlock or serialization failure occurs, roll back the entire transaction and retry a small, bounded number of times using the same idempotency key.
+
+The database must remain the authoritative source for seat ownership. A cache or queue must never independently decide that a seat is available.
+
 ## 5. Preventing Double-Booking
 
 Preventing two customers from buying the same seat is a critical correctness requirement.
@@ -220,6 +360,7 @@ If even one seat is unavailable, the transaction is rolled back and the customer
 ### Step 4: Commit the transaction
 
 The database commits the changes and releases the locks. If another customer requests the same seat concurrently, that request must wait for the first transaction and then recheck availability. It cannot successfully acquire the same active hold.
+When a customer requests multiple seats, the application locks seat rows in ascending seat_id order to reduce deadlocks. If another customer requests the same seat, the database makes the second transaction wait or fail, depending on the locking and timeout behavior. After acquiring the lock, the second request must recheck the current seat status and hold expiry before proceeding. If a deadlock or serialization failure occurs, the transaction is rolled back and retried a limited number of times. A unique constraint remains the final safeguard against duplicate seat allocations.
 
 ### Step 5: Complete payment and confirm the order
 
@@ -316,6 +457,20 @@ Application instances can scale horizontally, while rate limits and bounded queu
 The waiting room should release customers into checkout at a controlled rate based on measured database capacity. If the system reaches capacity, it should return a clear waiting response rather than accepting unlimited work and failing unpredictably.
 
 The system must also use monitoring, alerts, backups and tested recovery procedures. Traffic control may slow checkout during extreme demand, but it must never weaken seat-allocation safeguards.
+
+### 6.4 Request Paths and Component Coordination
+
+**Browsing:** The browser requests event details through the CDN, load balancer and application servers. The application checks the cache first and uses the read replica for suitable read-only queries when needed. Seat availability shown to customers is informational and may briefly be stale.
+
+**Seat reservation:** The request passes through the virtual waiting room and application servers to the primary database. A transaction locks the requested seat rows, checks availability, creates the hold and commits before returning a successful response.
+
+**Payment and confirmation:** The application creates a pending order and initiates payment without holding database seat locks. A verified payment webhook is authenticated and deduplicated. The application then uses a short transaction against the primary database to confirm the order, update seat status and create the ticket records consistently.
+
+**Hold expiration:** A background worker processes expired holds. It locks candidate seats, verifies the hold ID and expiry using the database clock, and releases only seats that still belong to the expired hold.
+
+**Failure recovery:** The system records payment and order states so that interrupted operations can be reconciled. Queue jobs and webhook handlers are idempotent, so retries do not create duplicate tickets. Monitoring alerts the team to growing queues, database contention, payment failures and delayed confirmations.
+
+The waiting room and cache improve throughput, but neither replaces database transactions or uniqueness constraints. The primary database remains the authority for seat ownership.
 
 ## 7. Trade-offs
 
